@@ -8,7 +8,7 @@ module stardust::alias {
     use sui::balance::{Self, Balance};
     use sui::coin::{Self, Coin};
     use sui::object_bag::{Self, ObjectBag};
-    // This is the only dependency you need for events.
+    // This is the only dependency you need for events
     use sui::event;
 
     /// For when non-governor
