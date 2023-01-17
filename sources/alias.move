@@ -1,12 +1,12 @@
 // We start by defining the 'alias' module inside the 'stardust' package
 module stardust::alias {
-    // A bunch of imports are needed from the sui framework to be able to work with objects, transactions
-    // Sui specific types.
-    use std::option::{Self, Option}; // A move variable that might be empty
+    // A bunch of imports are needed from the sui framework to be able to work with objects, transactions, etc.
+    // These are Sui specific types from the built-in Sui framework.
+    use std::option::{Self, Option}; // A move type representing a variable that might be empty
     use std::string::{Self, String}; // String type in the Sui framework
-    use std::vector; // Vector is a list
-    use sui::object::{Self, ID, UID}; // Objects must start with 'UID' privileged type
-    use sui::transfer; // Package to handle transfering of objects
+    use std::vector; // Vector is a list of variables
+    use sui::object::{Self, ID, UID}; // Objects must start with 'UID' privileged type to be valid Sui objects
+    use sui::transfer; // Module from the core package to handle transfering of objects
     use sui::tx_context::{Self, TxContext}; // Type to be able to access the current transaction context
     use sui::balance::{Self, Balance}; // Represents a balance of a coin
     use sui::coin::{Self, Coin}; // Represents a coin with balance
@@ -17,15 +17,17 @@ module stardust::alias {
     const ENotGovernor: u64 = 0; // When a non-governor tries excercise governor functions
     const ENotStateController: u64 = 1; // When a non-state-controller tries to excercise state controller functions
     const ENotCurrentNonce: u64 = 2; // Nonce is needed to keep track of current controllers. Returned when a past controller tries to act.
+    const EWrongResultPool: u64 = 3; // Returned when state transition initiated with wrong result pool (more about it later)
 
     // Let's define the structure of an alias.
     // This struct becomes a Move type that can be used as an object, becuase:
-    //  - it can be stored ('store keyword;)
-    //  - it has the key ability, so it can be indexed on storage via its unique ID (UID)
+    //  - it can be stored ('store' keyword;)
+    //  - it has the 'key' ability, so it can be indexed on storage via its unique ID (UID)
     //
     // 'T' is a type parameter that essentially means that an alias can be instantiated with whatever coin type
+    // 'phantom' is just a keyword that means "any type"
     struct Alias<phantom T> has key, store {
-        id: UID, // Globally unique identifier, determined upon creation
+        id: UID, // Globally unique identifier, determined upon creation, equivalent to AliasId
         base_token: Balance<T>, // iota/sui balance of an alias
         // Native token support not impelmented in this demo!
         native_tokens: Option<ObjectBag>, // (Optional)  A bag that can hold a collection of native token objects.
@@ -34,17 +36,18 @@ module stardust::alias {
         // Foundry logic not implemented in this demo!
         foundry_counter: u64, // Number of foundries created
         sender: Option<address>, // (Optional) Last sender of the alias
-        metadata: Option<vector<u8>>, // (Optional) metadata attached to the alias
-        issuer: Option<address>, // (Optional) issuer of the alias
-        immutable_metatada: Option<vector<u8>>, // (Optional) immutable metadata attached to the alias
+        metadata: Option<vector<u8>>, // (Optional) Metadata attached to the alias
+        issuer: Option<address>, // (Optional) Issuer of the alias
+        immutable_metatada: Option<vector<u8>>, // (Optional) Immutable metadata attached to the alias
         cap_nonce: u64, // Nonce that identifies the current state controller and governor
     }
 
     // How do we define the state controller and governor?
     // We will use the 'Capapility' pattern:
     //     - We essentially mint capability NFTs that give you the privilige to execute some function on the alias if you prove you own them.
-    //     - The NFTs a standalone objects themselves, but we don't implement a transfer function for them so they are soulbound.
+    //     - The NFTs are standalone objects themselves, but we don't implement a transfer function for them so they are soulbound.
     //     - To set a new controller, we require passing in the old NFTs, we destroy them and mint new ones.
+    // More info about the capability pattern here: https://www.move-patterns.com/capability.html
 
     // State controller capability
     struct StateCap has key, store {
@@ -79,15 +82,15 @@ module stardust::alias {
     //  - 'T' is still the type parameter that defines the type of base token for the alias
     //  - We need to pass in an object of 'Coin' type, these coins will be put into the alias
     //  - Immutable metadata is also set at creation
-    //  - TxContext is just a privileged type that gives us access to the context of the transaction at runtime
+    //  - TxContext is just a privileged type that gives us access to the context of the transaction at runtime. All entry functions must have this as argument.
     public entry fun create_alias<T>(c: Coin<T>, immutable_metatada: vector<u8>, ctx: &mut TxContext) {
         // Creation of a new unique id. Under the hood, the id is derived from the transaction hash.
         let id = object::new(ctx);
         // 'id' is of type 'UID' which is not allowed to be copied in code, so we just extract its value with a native
-        // function so we can refernce it in the capabilities.
+        // function so we can reference it in the capabilities.
         let alias_id = object::uid_to_inner(&id);
         
-        // Instansitation of an Alias Struct that can act as an object.
+        // Instantiation of an Alias Struct that can act as an object in the ledger.
         let a = Alias {
             id: id, // Must be if 'UID' type.
             base_token: coin::into_balance(c), // we destroy the passed in coin object and keep only its balance
@@ -98,11 +101,11 @@ module stardust::alias {
             sender: option::none(), // Empty
             metadata: option::none(), // Empty
             issuer: option::some(tx_context::sender(ctx)), // We se the issuer to be the sender of the current transaction
-            immutable_metatada: option::some(immutable_metatada), // We set the metadata
+            immutable_metatada: option::some(immutable_metatada), // We set the immutable metadata
             cap_nonce: 0, // Nonce starts from zero too
         };
 
-        // Event emittion. We create the event structs inline.
+        // Event emission. We create the event structs inline.
         event::emit(AliasCreated{id: object::uid_to_inner(&a.id), init_balance: balance::value<T>(&a.base_token)});
 
         // We make the alias object shared. A shared object doesn't have a single address owner but instead anyone can
@@ -114,29 +117,33 @@ module stardust::alias {
 
         // The state controller
         transfer::transfer(
+            // to be transfered object
             StateCap {
                 id: object::new(ctx),
                 ref_alias: alias_id,
                 nonce: 0
             },
+            // recipient
             tx_context::sender(ctx)
         );
         // The governor
         transfer::transfer(
+            // to be transfered object
             GovernorCap {
                 id: object::new(ctx),
                 ref_alias: alias_id,
                 nonce: 0},
+            // recipient
             tx_context::sender(ctx)
         );
     }
 
     // A bunch of utility functions to help working with our structs.
-    // Important: These functions can only be called from within this package!
+    // Important: These functions can only be called from within this module!
     // As a result, we lock what kind of operations are possible and what not. For example, there is no function to
     // update the immutable metadata so that operation can never be performed.
     // (note: it would be possible to make these functions:
-    //  - public (library functions)
+    //  - 'public' (library functions), so any other package/module can call them
     //  - or 'friendly', meaning we could define modules on other packages that are allowed to call them)
 
     // Increment the state index field of an alias
@@ -174,7 +181,7 @@ module stardust::alias {
         balance::join(&mut self.base_token, c);
     }
 
-    // Withdrae 'amount' of coins with type 'T' from the alias
+    // Withdraw 'amount' of coins with type 'T' from the alias
     fun withdraw<T>(self: &mut Alias<T>, amount: u64): Balance<T> {
         balance::split(&mut self.base_token, amount)
     }
@@ -192,7 +199,7 @@ module stardust::alias {
     }
 
     // Public entry function do destroy a state controller capability. Needed to be able to clean it up once your capability
-    // expired. If we don't define such a function inside this module, no one woudl be able to delete/throw away a capability
+    // expired. If we don't define such a function inside this module, no one would be able to delete/throw away a capability
     // NFT.
     public entry fun destroy_state_cap(s: StateCap, _ctx: &mut TxContext) {
         // Since the cap was passed into the function by value, we can decompose it.
@@ -201,13 +208,13 @@ module stardust::alias {
         // Note: the UID field ('id1') needs to be deleted with special API, the other field types have the 'drop' ability.
         let StateCap {
             id: id1,
-            ref_alias: _,
+            ref_alias: _, // we just forget these values as they have the 'drop' ability.
             nonce: _,
         } = s;
 
         // Deletion of a variable with UID type.
         object::delete(id1);
-        // At this point the NFT cease to exist and as a result of the transaction it is deleted from global storage.
+        // At this point the NFT ceases to exist and as a result of the transaction it is deleted from global storage.
     }
 
     // Public entry function to destroy a governor cap. Same as above.
@@ -225,7 +232,7 @@ module stardust::alias {
     // Implementation of a governance state transition.
     // Such a transition can only change:
     //  - state controller,
-    //  - gvernor,
+    //  - governor,
     //  - metadata
     public entry fun governance_transition<T>(
         g: GovernorCap, // A governor cap must be passed in here
@@ -268,18 +275,18 @@ module stardust::alias {
         }
 
     // Time to implement the state transition. So what does a state transition do when an alias is used in ISC (stardust)?
-    //  - it takes a bunch of on-ledger reguests, consume them in the transaction
-    //  - executes the requests one by one, generatting new L2 state and possible resulting payout/outputs
+    //  - it takes a bunch of on-ledger reguests, consumes them in the transaction,
+    //  - executes the requests one by one, generating new L2 state and possible resulting payouts/outputs
     //
     // We run into a problem with Sui though: An entry function can not take variable size inputs, so we can't just
     //  say "pass in a list of requests". Also, to be able to send something to an alias by it's UID (address), users
-    // must posses access rights to it. Sui lacks the alias address unlock condition.
+    // must possess access rights to it. Sui lacks the alias address unlock condition.
     //
     // Therefore, we will create another layer: the MemPool.
     //  - The Mempool is a shared object tighly coupled to the alias.
     //  - Users can put their requests in the MemPool to be processed by the ISC chain controlling the alias
     //  - Once enough requests are in the MemPool, the alias can state transition by referencing the single MemPool
-    //    object that ocntains all the requests to be executed.
+    //    object that contains all the requests to be executed.
     //
     // Flowchart:
     // Step 1: Users send requests: !!!send_request() function!!!
@@ -299,23 +306,25 @@ module stardust::alias {
     //   -> (Updated Alias, Depleted Mempool, Depleted ExecutionResultPool, sent out RequestResult A, RequestResult B, RequestResult C)
 
 
-    // First, we need to define the structs for requests, the mempool the request result and some utility structs.
+    // First, we need to define the structs for requests, the mempool, the request result and some utility structs.
 
     // An on-ledger request is essentially a Basic Output that holds tokens, has a sender and metadata
+    // As we only store requests inside a mempool object, this type doesn't have to have 'key' ability and 'UID'.
+    // We still need 'store' because the struct has to be serializable inside a MemPool object.
     struct OnLedgerRequest<phantom T> has store {
         base_token: Balance<T>,
         sender: address, // validated sender of the request
         calldata: vector<u8>, // command to L2, encoded in 'metadata feature' in stardust
     }
 
-    // Am object that holds a list of to-be processed OnLedgerRequests
+    // An object that holds a list of to-be processed OnLedgerRequests
     struct MemPool<phantom T> has key, store {
         id: UID,
         ref_alias: ID,
         pool: vector<OnLedgerRequest<T>>,
     }
 
-    // A request result is payout as a result of processing a request oin the L2 VM.
+    // A request result is payout as a result of processing a request in the L2 VM.
     struct RequestResult<phantom T> has key, store {
         id: UID,
         base_token: Balance<T>,
@@ -329,7 +338,7 @@ module stardust::alias {
     //   - process the requests in them on L2, determining their results
     //   - put the results in the ResultPool
     //   - call the state_transition() function on L1 with the MemPool, Alias and ResultPool
-    //   - The effect of the state_transition() function is that it initiates the sending of RequestResult's to recipients
+    //   - The effect of the state_transition() function is that it initiates the sending of RequestResults to recipients
     //     in the ResultPool
     struct ExecutionResultPool has key, store {
         id: UID,
@@ -337,10 +346,10 @@ module stardust::alias {
         pool: vector<ExecutionResult>,
     }
 
-    // A pure utility struct that hold information on who to send out RequestResults.
+    // A pure utility struct that holds information on who to send out RequestResults.
     struct ExecutionResult has store, drop {
         payout: u64,
-        //request_id: String,
+        //request_id: String, we could put here for example the original requestId of the OnLedgerRequest
         recipient: address,
     }
 
@@ -363,7 +372,7 @@ module stardust::alias {
     public entry fun create_exec_results<T>(s: StateCap, self: &mut Alias<T>, n: u64, a: address, ctx: &mut TxContext){
         // only holder of the current state cap can call this
         check_state_cap(&s, self);
-        // Since state cap was passed in via value, we will just send it back tto where it came from
+        // Since state cap was passed in via value, we will just send it back to where it came from
         transfer::transfer(s, tx_context::sender(ctx));
 
         // An empty list
@@ -396,7 +405,7 @@ module stardust::alias {
         transfer::transfer(s, tx_context::sender(ctx));
 
        // Is this the correct ExecutionResultPool?
-        assert!(out.ref_alias == object::uid_to_inner(&self.id), 10);
+        assert!(out.ref_alias == object::uid_to_inner(&self.id), EWrongResultPool);
 
         // increment state index
         increment_state_index(self);
@@ -409,7 +418,7 @@ module stardust::alias {
 
         // Book incoming on ledger requests (equivalent to consuming BasicOutputs that represent on-ledger requests)
         // the actual logic happens on L2, here we just imitate that all requests deposit their coins into the alias
-        vector::reverse<OnLedgerRequest<T>>(&mut mempool.pool);
+        vector::reverse<OnLedgerRequest<T>>(&mut mempool.pool); // we process them in incoming order
 
         while (!vector::is_empty<OnLedgerRequest<T>>(&mempool.pool)) {
             // The L2 VM would fetch this info and execute it on L2
@@ -426,7 +435,7 @@ module stardust::alias {
 
         // Settle request execution results
         // What is in the result is determined by L2 (ISC committee)? L1 is blind to it, that's why we need a list
-        // of result in ExecutionResultPool
+        // of results in ExecutionResultPool
 
         // reverse the pool so we start with oldest first
         vector::reverse<ExecutionResult>(&mut out.pool);
